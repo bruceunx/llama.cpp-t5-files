@@ -312,6 +312,7 @@ int main(int argc, char **argv) {
 
   while (std::getline(inputFile, prompt)) {
 
+    llama_kv_cache_clear(ctx);
     embd_inp = ::llama_tokenize(ctx, prompt, true, true);
     // Should not run without any tokens
     if (embd_inp.empty()) {
@@ -332,50 +333,54 @@ int main(int argc, char **argv) {
     }
 
     // debug message about similarity of saved session, if applicable
-    size_t n_matching_session_tokens = 0;
-    if (!session_tokens.empty()) {
-      for (llama_token id : session_tokens) {
-        if (n_matching_session_tokens >= embd_inp.size() ||
-            id != embd_inp[n_matching_session_tokens]) {
-          break;
-        }
-        n_matching_session_tokens++;
-      }
-      if (params.prompt.empty() &&
-          n_matching_session_tokens == embd_inp.size()) {
-        LOG_TEE("%s: using full prompt from session file\n", __func__);
-      } else if (n_matching_session_tokens >= embd_inp.size()) {
-        LOG_TEE("%s: session file has exact match for prompt!\n", __func__);
-      } else if (n_matching_session_tokens < (embd_inp.size() / 2)) {
-        LOG_TEE("%s: warning: session file has low similarity to prompt (%zu / "
-                "%zu tokens); will mostly be reevaluated\n",
-                __func__, n_matching_session_tokens, embd_inp.size());
-      } else {
-        LOG_TEE("%s: session file matches %zu / %zu tokens of prompt\n",
-                __func__, n_matching_session_tokens, embd_inp.size());
-      }
-
-      // remove any "future" tokens that we might have inherited from the
-      // previous session
-      llama_kv_cache_seq_rm(ctx, -1, n_matching_session_tokens, -1);
-    }
-
-    LOGLN("recalculate the cached logits (check): embd_inp.empty() %s, "
-          "n_matching_session_tokens %zu, embd_inp.size() %zu, "
-          "session_tokens.size() %zu, embd_inp.size() %zu",
-          log_tostr(embd_inp.empty()), n_matching_session_tokens,
-          embd_inp.size(), session_tokens.size(), embd_inp.size());
-
-    // if we will use the cache for the full prompt without reaching the end of
-    // the cache, force reevaluation of the last token to recalculate the cached
-    // logits
-    if (!embd_inp.empty() && n_matching_session_tokens == embd_inp.size() &&
-        session_tokens.size() > embd_inp.size()) {
-      LOGLN("recalculate the cached logits (do): session_tokens.resize( %zu )",
-            embd_inp.size() - 1);
-
-      session_tokens.resize(embd_inp.size() - 1);
-    }
+    // size_t n_matching_session_tokens = 0;
+    // if (!session_tokens.empty()) {
+    //   for (llama_token id : session_tokens) {
+    //     if (n_matching_session_tokens >= embd_inp.size() ||
+    //         id != embd_inp[n_matching_session_tokens]) {
+    //       break;
+    //     }
+    //     n_matching_session_tokens++;
+    //   }
+    //   if (params.prompt.empty() &&
+    //       n_matching_session_tokens == embd_inp.size()) {
+    //     LOG_TEE("%s: using full prompt from session file\n", __func__);
+    //   } else if (n_matching_session_tokens >= embd_inp.size()) {
+    //     LOG_TEE("%s: session file has exact match for prompt!\n", __func__);
+    //   } else if (n_matching_session_tokens < (embd_inp.size() / 2)) {
+    //     LOG_TEE("%s: warning: session file has low similarity to prompt (%zu
+    //     / "
+    //             "%zu tokens); will mostly be reevaluated\n",
+    //             __func__, n_matching_session_tokens, embd_inp.size());
+    //   } else {
+    //     LOG_TEE("%s: session file matches %zu / %zu tokens of prompt\n",
+    //             __func__, n_matching_session_tokens, embd_inp.size());
+    //   }
+    //
+    //   // remove any "future" tokens that we might have inherited from the
+    //   // previous session
+    //   llama_kv_cache_seq_rm(ctx, -1, n_matching_session_tokens, -1);
+    // }
+    //
+    // LOGLN("recalculate the cached logits (check): embd_inp.empty() %s, "
+    //       "n_matching_session_tokens %zu, embd_inp.size() %zu, "
+    //       "session_tokens.size() %zu, embd_inp.size() %zu",
+    //       log_tostr(embd_inp.empty()), n_matching_session_tokens,
+    //       embd_inp.size(), session_tokens.size(), embd_inp.size());
+    //
+    // // if we will use the cache for the full prompt without reaching the end
+    // of
+    // // the cache, force reevaluation of the last token to recalculate the
+    // cached
+    // // logits
+    // if (!embd_inp.empty() && n_matching_session_tokens == embd_inp.size() &&
+    //     session_tokens.size() > embd_inp.size()) {
+    //   LOGLN("recalculate the cached logits (do): session_tokens.resize( %zu
+    //   )",
+    //         embd_inp.size() - 1);
+    //
+    //   session_tokens.resize(embd_inp.size() - 1);
+    // }
 
     // number of tokens to keep when resetting context
     if (params.n_keep < 0 || params.n_keep > (int)embd_inp.size()) {
@@ -431,8 +436,8 @@ int main(int argc, char **argv) {
     bool is_antiprompt = false;
     bool input_echo = true;
     bool display = true;
-    bool need_to_save_session =
-        !path_session.empty() && n_matching_session_tokens < embd_inp.size();
+    // bool need_to_save_session =
+    //     !path_session.empty() && n_matching_session_tokens < embd_inp.size();
 
     int n_past = 0;
     int n_remain = params.n_predict;
@@ -479,7 +484,7 @@ int main(int argc, char **argv) {
 
       if (llama_encode(
               ctx, llama_batch_get_one(enc_input_buf, enc_input_size, 0, 0))) {
-        LOG_TEE("%s : failed to eval\n", __func__);
+        LOG_TEE("%s : failed to eval encode\n", __func__);
         return 1;
       }
 
@@ -608,7 +613,7 @@ int main(int argc, char **argv) {
 
           if (llama_decode(ctx,
                            llama_batch_get_one(&embd[i], n_eval, n_past, 0))) {
-            LOG_TEE("%s : failed to eval\n", __func__);
+            LOG_TEE("%s : failed to eval decode\n", __func__);
             return 1;
           }
 
@@ -634,14 +639,15 @@ int main(int argc, char **argv) {
       if ((int)embd_inp.size() <= n_consumed && !is_interacting) {
         // optionally save the session on first sample (for faster prompt
         // loading next time)
-        if (!path_session.empty() && need_to_save_session &&
-            !params.prompt_cache_ro) {
-          need_to_save_session = false;
-          llama_state_save_file(ctx, path_session.c_str(),
-                                session_tokens.data(), session_tokens.size());
-
-          LOG("saved session to %s\n", path_session.c_str());
-        }
+        // if (!path_session.empty() && need_to_save_session &&
+        //     !params.prompt_cache_ro) {
+        //   need_to_save_session = false;
+        //   llama_state_save_file(ctx, path_session.c_str(),
+        //                         session_tokens.data(),
+        //                         session_tokens.size());
+        //
+        //   LOG("saved session to %s\n", path_session.c_str());
+        // }
 
         const llama_token id =
             llama_sampling_sample(ctx_sampling, ctx, ctx_guidance);
