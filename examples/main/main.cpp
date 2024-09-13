@@ -303,512 +303,518 @@ int main(int argc, char **argv) {
   std::ifstream inputFile(filePath);
 
   // Check if the file was opened successfully
-  // if (!inputFile.is_open()) {
-  //   std::cerr << "Could not open the file: " << filePath << std::endl;
-  //   return 1;
-  // }
-
-  std::string prompt = params.prompt;
-
-  // while (std::getline(inputFile, prompt)) {
-
-  llama_kv_cache_clear(ctx);
-  embd_inp = ::llama_tokenize(ctx, prompt, true, true);
-  // Should not run without any tokens
-  if (embd_inp.empty()) {
-    if (add_bos) {
-      embd_inp.push_back(llama_token_bos(model));
-      LOG("embd_inp was considered empty and bos was added: %s\n",
-          LOG_TOKENS_TOSTR_PRETTY(ctx, embd_inp).c_str());
-    } else {
-      LOG_TEE("error: input is empty\n");
-      return -1;
-    }
-  }
-
-  if ((int)embd_inp.size() > n_ctx - 4) {
-    LOG_TEE("%s: error: prompt is too long (%d tokens, max %d)\n", __func__,
-            (int)embd_inp.size(), n_ctx - 4);
+  if (!inputFile.is_open()) {
+    std::cerr << "Could not open the file: " << filePath << std::endl;
     return 1;
   }
 
-  // debug message about similarity of saved session, if applicable
-  // size_t n_matching_session_tokens = 0;
-  // if (!session_tokens.empty()) {
-  //   for (llama_token id : session_tokens) {
-  //     if (n_matching_session_tokens >= embd_inp.size() ||
-  //         id != embd_inp[n_matching_session_tokens]) {
-  //       break;
-  //     }
-  //     n_matching_session_tokens++;
-  //   }
-  //   if (params.prompt.empty() &&
-  //       n_matching_session_tokens == embd_inp.size()) {
-  //     LOG_TEE("%s: using full prompt from session file\n", __func__);
-  //   } else if (n_matching_session_tokens >= embd_inp.size()) {
-  //     LOG_TEE("%s: session file has exact match for prompt!\n", __func__);
-  //   } else if (n_matching_session_tokens < (embd_inp.size() / 2)) {
-  //     LOG_TEE("%s: warning: session file has low similarity to prompt (%zu
-  //     / "
-  //             "%zu tokens); will mostly be reevaluated\n",
-  //             __func__, n_matching_session_tokens, embd_inp.size());
-  //   } else {
-  //     LOG_TEE("%s: session file matches %zu / %zu tokens of prompt\n",
-  //             __func__, n_matching_session_tokens, embd_inp.size());
-  //   }
-  //
-  //   // remove any "future" tokens that we might have inherited from the
-  //   // previous session
-  //   llama_kv_cache_seq_rm(ctx, -1, n_matching_session_tokens, -1);
-  // }
-  //
-  // LOGLN("recalculate the cached logits (check): embd_inp.empty() %s, "
-  //       "n_matching_session_tokens %zu, embd_inp.size() %zu, "
-  //       "session_tokens.size() %zu, embd_inp.size() %zu",
-  //       log_tostr(embd_inp.empty()), n_matching_session_tokens,
-  //       embd_inp.size(), session_tokens.size(), embd_inp.size());
-  //
-  // // if we will use the cache for the full prompt without reaching the end
-  // of
-  // // the cache, force reevaluation of the last token to recalculate the
-  // cached
-  // // logits
-  // if (!embd_inp.empty() && n_matching_session_tokens == embd_inp.size() &&
-  //     session_tokens.size() > embd_inp.size()) {
-  //   LOGLN("recalculate the cached logits (do): session_tokens.resize( %zu
-  //   )",
-  //         embd_inp.size() - 1);
-  //
-  //   session_tokens.resize(embd_inp.size() - 1);
-  // }
+  std::string prompt;
+  // std::string prompt = params.prompt;
 
-  // number of tokens to keep when resetting context
-  if (params.n_keep < 0 || params.n_keep > (int)embd_inp.size()) {
-    params.n_keep = (int)embd_inp.size();
-  } else {
-    params.n_keep += add_bos; // always keep the BOS token
-  }
+  while (std::getline(inputFile, prompt)) {
 
-  // ctrl+C handling
-  {
-#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
-    struct sigaction sigint_action;
-    sigint_action.sa_handler = sigint_handler;
-    sigemptyset(&sigint_action.sa_mask);
-    sigint_action.sa_flags = 0;
-    sigaction(SIGINT, &sigint_action, NULL);
-#elif defined(_WIN32)
-    auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
-      return (ctrl_type == CTRL_C_EVENT) ? (sigint_handler(SIGINT), true)
-                                         : false;
-    };
-    SetConsoleCtrlHandler(
-        reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
-#endif
-  }
+    llama_kv_cache_clear(ctx);
+    embd_inp = ::llama_tokenize(ctx, prompt, true, true);
+    // Should not run without any tokens
+    if (embd_inp.empty()) {
+      if (add_bos) {
+        embd_inp.push_back(llama_token_bos(model));
+        LOG("embd_inp was considered empty and bos was added: %s\n",
+            LOG_TOKENS_TOSTR_PRETTY(ctx, embd_inp).c_str());
+      } else {
+        LOG_TEE("error: input is empty\n");
+        return -1;
+      }
+    }
 
-  LOG_TEE("sampling: \n%s\n", llama_sampling_print(sparams).c_str());
-  LOG_TEE("sampling order: \n%s\n",
-          llama_sampling_order_print(sparams).c_str());
-  LOG_TEE("generate: n_ctx = %d, n_batch = %d, n_predict = %d, n_keep = %d\n",
-          n_ctx, params.n_batch, params.n_predict, params.n_keep);
-
-  // group-attention state
-  // number of grouped KV tokens so far (used only if params.grp_attn_n > 1)
-  int ga_i = 0;
-
-  const int ga_n = params.grp_attn_n;
-  const int ga_w = params.grp_attn_w;
-
-  if (ga_n != 1) {
-    GGML_ASSERT(ga_n > 0 && "grp_attn_n must be positive"); // NOLINT
-    GGML_ASSERT(ga_w % ga_n == 0 &&
-                "grp_attn_w must be a multiple of grp_attn_n"); // NOLINT
-    // GGML_ASSERT(n_ctx_train % ga_w == 0     && "n_ctx_train must be a
-    // multiple of grp_attn_w");    // NOLINT GGML_ASSERT(n_ctx >= n_ctx_train
-    // * ga_n && "n_ctx must be at least n_ctx_train * grp_attn_n"); // NOLINT
-    LOG_TEE("self-extend: n_ctx_train = %d, grp_attn_n = %d, grp_attn_w = %d\n",
-            n_ctx_train, ga_n, ga_w);
-  }
-  LOG_TEE("\n\n");
-
-  bool is_antiprompt = false;
-  bool input_echo = true;
-  bool display = true;
-  // bool need_to_save_session =
-  //     !path_session.empty() && n_matching_session_tokens < embd_inp.size();
-
-  int n_past = 0;
-  int n_remain = params.n_predict;
-  int n_consumed = 0;
-  int n_session_consumed = 0;
-  int n_past_guidance = 0;
-
-  std::vector<int> input_tokens;
-  g_input_tokens = &input_tokens;
-  std::vector<int> output_tokens;
-  g_output_tokens = &output_tokens;
-  std::ostringstream output_ss;
-  g_output_ss = &output_ss;
-  std::ostringstream assistant_ss; // for storing current assistant message,
-                                   // used in conversation mode
-
-  // the first thing we will do is to output the prompt, so set color
-  // accordingly
-  console::set_display(console::prompt);
-  display = params.display_prompt;
-
-  std::vector<llama_token> embd;
-  std::vector<llama_token> embd_guidance;
-
-  // tokenized antiprompts
-  std::vector<std::vector<llama_token>> antiprompt_ids;
-
-  antiprompt_ids.reserve(params.antiprompt.size());
-  for (const std::string &antiprompt : params.antiprompt) {
-    antiprompt_ids.emplace_back(::llama_tokenize(ctx, antiprompt, false, true));
-  }
-
-  struct llama_sampling_context *ctx_sampling = llama_sampling_init(sparams);
-  if (!ctx_sampling) {
-    fprintf(stderr, "%s: failed to initialize sampling subsystem\n", __func__);
-    exit(1);
-  }
-
-  if (llama_model_has_encoder(model)) {
-    int enc_input_size = embd_inp.size();
-    llama_token *enc_input_buf = embd_inp.data();
-
-    if (llama_encode(
-            ctx, llama_batch_get_one(enc_input_buf, enc_input_size, 0, 0))) {
-      LOG_TEE("%s : failed to eval encode\n", __func__);
+    if ((int)embd_inp.size() > n_ctx - 4) {
+      LOG_TEE("%s: error: prompt is too long (%d tokens, max %d)\n", __func__,
+              (int)embd_inp.size(), n_ctx - 4);
       return 1;
     }
 
-    llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
-    if (decoder_start_token_id == -1) {
-      decoder_start_token_id = llama_token_bos(model);
-    }
+    // debug message about similarity of saved session, if applicable
+    // size_t n_matching_session_tokens = 0;
+    // if (!session_tokens.empty()) {
+    //   for (llama_token id : session_tokens) {
+    //     if (n_matching_session_tokens >= embd_inp.size() ||
+    //         id != embd_inp[n_matching_session_tokens]) {
+    //       break;
+    //     }
+    //     n_matching_session_tokens++;
+    //   }
+    //   if (params.prompt.empty() &&
+    //       n_matching_session_tokens == embd_inp.size()) {
+    //     LOG_TEE("%s: using full prompt from session file\n", __func__);
+    //   } else if (n_matching_session_tokens >= embd_inp.size()) {
+    //     LOG_TEE("%s: session file has exact match for prompt!\n", __func__);
+    //   } else if (n_matching_session_tokens < (embd_inp.size() / 2)) {
+    //     LOG_TEE("%s: warning: session file has low similarity to prompt (%zu
+    //     / "
+    //             "%zu tokens); will mostly be reevaluated\n",
+    //             __func__, n_matching_session_tokens, embd_inp.size());
+    //   } else {
+    //     LOG_TEE("%s: session file matches %zu / %zu tokens of prompt\n",
+    //             __func__, n_matching_session_tokens, embd_inp.size());
+    //   }
+    //
+    //   // remove any "future" tokens that we might have inherited from the
+    //   // previous session
+    //   llama_kv_cache_seq_rm(ctx, -1, n_matching_session_tokens, -1);
+    // }
+    //
+    // LOGLN("recalculate the cached logits (check): embd_inp.empty() %s, "
+    //       "n_matching_session_tokens %zu, embd_inp.size() %zu, "
+    //       "session_tokens.size() %zu, embd_inp.size() %zu",
+    //       log_tostr(embd_inp.empty()), n_matching_session_tokens,
+    //       embd_inp.size(), session_tokens.size(), embd_inp.size());
+    //
+    // // if we will use the cache for the full prompt without reaching the end
+    // of
+    // // the cache, force reevaluation of the last token to recalculate the
+    // cached
+    // // logits
+    // if (!embd_inp.empty() && n_matching_session_tokens == embd_inp.size() &&
+    //     session_tokens.size() > embd_inp.size()) {
+    //   LOGLN("recalculate the cached logits (do): session_tokens.resize( %zu
+    //   )",
+    //         embd_inp.size() - 1);
+    //
+    //   session_tokens.resize(embd_inp.size() - 1);
+    // }
 
-    embd_inp.clear();
-    embd_inp.push_back(decoder_start_token_id);
-  }
-
-  while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
-    // predict
-    // LOG_TEE("%s-%s-%d", params.interactive ? "true" : "false",
-    //         is_antiprompt ? "true" : "false", n_remain);
-    if (!embd.empty()) {
-      // Note: (n_ctx - 4) here is to match the logic for commandline prompt
-      // handling via
-      // --prompt or --file which uses the same value.
-      int max_embd_size = n_ctx - 4;
-
-      if (ga_n == 1) {
-        // infinite text generation via context shifting
-        // if we run out of context:
-        // - take the n_keep first tokens from the original prompt (via
-        // n_past)
-        // - take half of the last (n_ctx - n_keep) tokens and recompute the
-        // logits in batches
-        if (n_past + (int)embd.size() >= n_ctx) {
-          if (params.n_predict == -2) {
-            LOG_TEE("\n\n%s: context full and n_predict == -%d => stopping\n",
-                    __func__, params.n_predict);
-            break;
-          }
-
-          const int n_left = n_past - params.n_keep;
-          const int n_discard = n_left / 2;
-
-          LOG("context full, swapping: n_past = %d, n_left = %d, n_ctx = %d, "
-              "n_keep = %d, n_discard = %d\n",
-              n_past, n_left, n_ctx, params.n_keep, n_discard);
-
-          llama_kv_cache_seq_rm(ctx, 0, params.n_keep,
-                                params.n_keep + n_discard);
-          llama_kv_cache_seq_add(ctx, 0, params.n_keep + n_discard, n_past,
-                                 -n_discard);
-
-          n_past -= n_discard;
-
-          if (ctx_guidance) {
-            n_past_guidance -= n_discard;
-          }
-
-          LOG("after swap: n_past = %d, n_past_guidance = %d\n", n_past,
-              n_past_guidance);
-
-          LOG("embd: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd).c_str());
-
-          LOG("clear session path\n");
-          path_session.clear();
-        }
-      } else {
-        // context extension via Self-Extend
-        while (n_past >= ga_i + ga_w) {
-          const int ib = (ga_n * ga_i) / ga_w;
-          const int bd = (ga_w / ga_n) * (ga_n - 1);
-          const int dd = (ga_w / ga_n) - ib * bd - ga_w;
-
-          LOG("\n");
-          LOG("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", ga_i, n_past, ib * bd,
-              ga_i + ib * bd, n_past + ib * bd);
-          LOG("div:   [%6d, %6d] / %6d -> [%6d, %6d]\n", ga_i + ib * bd,
-              ga_i + ib * bd + ga_w, ga_n, (ga_i + ib * bd) / ga_n,
-              (ga_i + ib * bd + ga_w) / ga_n);
-          LOG("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", ga_i + ib * bd + ga_w,
-              n_past + ib * bd, dd, ga_i + ib * bd + ga_w + dd,
-              n_past + ib * bd + dd);
-
-          llama_kv_cache_seq_add(ctx, 0, ga_i, n_past, ib * bd);
-          llama_kv_cache_seq_div(ctx, 0, ga_i + ib * bd, ga_i + ib * bd + ga_w,
-                                 ga_n);
-          llama_kv_cache_seq_add(ctx, 0, ga_i + ib * bd + ga_w,
-                                 n_past + ib * bd, dd);
-
-          n_past -= bd;
-
-          ga_i += ga_w / ga_n;
-
-          LOG("\nn_past_old = %d, n_past = %d, ga_i = %d\n\n", n_past + bd,
-              n_past, ga_i);
-        }
-      }
-
-      // try to reuse a matching prefix from the loaded session instead of
-      // re-eval (via n_past)
-      if (n_session_consumed < (int)session_tokens.size()) {
-        size_t i = 0;
-        for (; i < embd.size(); i++) {
-          if (embd[i] != session_tokens[n_session_consumed]) {
-            session_tokens.resize(n_session_consumed);
-            break;
-          }
-
-          n_past++;
-          n_session_consumed++;
-
-          if (n_session_consumed >= (int)session_tokens.size()) {
-            ++i;
-            break;
-          }
-        }
-        if (i > 0) {
-          embd.erase(embd.begin(), embd.begin() + i);
-        }
-      }
-
-      for (int i = 0; i < (int)embd.size(); i += params.n_batch) {
-        int n_eval = (int)embd.size() - i;
-        if (n_eval > params.n_batch) {
-          n_eval = params.n_batch;
-        }
-
-        LOG("eval: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd).c_str());
-
-        if (llama_decode(ctx,
-                         llama_batch_get_one(&embd[i], n_eval, n_past, 0))) {
-          LOG_TEE("%s : failed to eval decode\n", __func__);
-          return 1;
-        }
-
-        n_past += n_eval;
-
-        LOG("n_past = %d\n", n_past);
-        // Display total tokens alongside total time
-        if (params.n_print > 0 && n_past % params.n_print == 0) {
-          LOG_TEE("\n\033[31mTokens consumed so far = %d / %d \033[0m\n",
-                  n_past, n_ctx);
-        }
-      }
-
-      if (!embd.empty() && !path_session.empty()) {
-        session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
-        n_session_consumed = session_tokens.size();
-      }
-    }
-
-    embd.clear();
-    embd_guidance.clear();
-
-    if ((int)embd_inp.size() <= n_consumed && !is_interacting) {
-      // optionally save the session on first sample (for faster prompt
-      // loading next time)
-      // if (!path_session.empty() && need_to_save_session &&
-      //     !params.prompt_cache_ro) {
-      //   need_to_save_session = false;
-      //   llama_state_save_file(ctx, path_session.c_str(),
-      //                         session_tokens.data(),
-      //                         session_tokens.size());
-      //
-      //   LOG("saved session to %s\n", path_session.c_str());
-      // }
-
-      const llama_token id =
-          llama_sampling_sample(ctx_sampling, ctx, ctx_guidance);
-
-      llama_sampling_accept(ctx_sampling, ctx, id, /* apply_grammar= */ true);
-
-      LOG("last: %s\n",
-          LOG_TOKENS_TOSTR_PRETTY(ctx, ctx_sampling->prev).c_str());
-
-      embd.push_back(id);
-
-      // echo this to console
-      input_echo = true;
-
-      // decrement remaining sampling budget
-      --n_remain;
-
-      LOG("n_remain: %d\n", n_remain);
+    // number of tokens to keep when resetting context
+    if (params.n_keep < 0 || params.n_keep > (int)embd_inp.size()) {
+      params.n_keep = (int)embd_inp.size();
     } else {
-      // some user input remains from prompt or interaction, forward it to
-      // processing
-      LOG("embd_inp.size(): %d, n_consumed: %d\n", (int)embd_inp.size(),
-          n_consumed);
-      while ((int)embd_inp.size() > n_consumed) {
-        embd.push_back(embd_inp[n_consumed]);
-
-        // push the prompt in the sampling context in order to apply
-        // repetition penalties later for the prompt, we don't apply grammar
-        // rules
-        llama_sampling_accept(ctx_sampling, ctx, embd_inp[n_consumed],
-                              /* apply_grammar= */ false);
-
-        ++n_consumed;
-        if ((int)embd.size() >= params.n_batch) {
-          break;
-        }
-      }
+      params.n_keep += add_bos; // always keep the BOS token
     }
 
-    // display text
-    if (input_echo && display) {
-      for (auto id : embd) {
-        const std::string token_str =
-            llama_token_to_piece(ctx, id, params.special);
+    // ctrl+C handling
+    {
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+      struct sigaction sigint_action;
+      sigint_action.sa_handler = sigint_handler;
+      sigemptyset(&sigint_action.sa_mask);
+      sigint_action.sa_flags = 0;
+      sigaction(SIGINT, &sigint_action, NULL);
+#elif defined(_WIN32)
+      auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
+        return (ctrl_type == CTRL_C_EVENT) ? (sigint_handler(SIGINT), true)
+                                           : false;
+      };
+      SetConsoleCtrlHandler(
+          reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
+#endif
+    }
 
-        // Console/Stream Output
-        // fprintf(stdout, "%s", token_str.c_str());
-        printf("%s", token_str.c_str());
+    LOG_TEE("sampling: \n%s\n", llama_sampling_print(sparams).c_str());
+    LOG_TEE("sampling order: \n%s\n",
+            llama_sampling_order_print(sparams).c_str());
+    LOG_TEE("generate: n_ctx = %d, n_batch = %d, n_predict = %d, n_keep = %d\n",
+            n_ctx, params.n_batch, params.n_predict, params.n_keep);
 
-        // Record Displayed Tokens To Log
-        // Note: Generated tokens are created one by one hence this check
-        if (embd.size() > 1) {
-          // Incoming Requested Tokens
-          input_tokens.push_back(id);
+    // group-attention state
+    // number of grouped KV tokens so far (used only if params.grp_attn_n > 1)
+    int ga_i = 0;
+
+    const int ga_n = params.grp_attn_n;
+    const int ga_w = params.grp_attn_w;
+
+    if (ga_n != 1) {
+      GGML_ASSERT(ga_n > 0 && "grp_attn_n must be positive"); // NOLINT
+      GGML_ASSERT(ga_w % ga_n == 0 &&
+                  "grp_attn_w must be a multiple of grp_attn_n"); // NOLINT
+      // GGML_ASSERT(n_ctx_train % ga_w == 0     && "n_ctx_train must be a
+      // multiple of grp_attn_w");    // NOLINT GGML_ASSERT(n_ctx >= n_ctx_train
+      // * ga_n && "n_ctx must be at least n_ctx_train * grp_attn_n"); // NOLINT
+      LOG_TEE(
+          "self-extend: n_ctx_train = %d, grp_attn_n = %d, grp_attn_w = %d\n",
+          n_ctx_train, ga_n, ga_w);
+    }
+    LOG_TEE("\n\n");
+
+    bool is_antiprompt = false;
+    bool input_echo = true;
+    bool display = true;
+    // bool need_to_save_session =
+    //     !path_session.empty() && n_matching_session_tokens < embd_inp.size();
+
+    int n_past = 0;
+    int n_remain = params.n_predict;
+    int n_consumed = 0;
+    int n_session_consumed = 0;
+    int n_past_guidance = 0;
+
+    std::vector<int> input_tokens;
+    g_input_tokens = &input_tokens;
+    std::vector<int> output_tokens;
+    g_output_tokens = &output_tokens;
+    std::ostringstream output_ss;
+    g_output_ss = &output_ss;
+    std::ostringstream assistant_ss; // for storing current assistant message,
+                                     // used in conversation mode
+
+    // the first thing we will do is to output the prompt, so set color
+    // accordingly
+    console::set_display(console::prompt);
+    display = params.display_prompt;
+
+    std::vector<llama_token> embd;
+    std::vector<llama_token> embd_guidance;
+
+    // tokenized antiprompts
+    std::vector<std::vector<llama_token>> antiprompt_ids;
+
+    antiprompt_ids.reserve(params.antiprompt.size());
+    for (const std::string &antiprompt : params.antiprompt) {
+      antiprompt_ids.emplace_back(
+          ::llama_tokenize(ctx, antiprompt, false, true));
+    }
+
+    struct llama_sampling_context *ctx_sampling = llama_sampling_init(sparams);
+    if (!ctx_sampling) {
+      fprintf(stderr, "%s: failed to initialize sampling subsystem\n",
+              __func__);
+      exit(1);
+    }
+
+    if (llama_model_has_encoder(model)) {
+      int enc_input_size = embd_inp.size();
+      llama_token *enc_input_buf = embd_inp.data();
+
+      if (llama_encode(
+              ctx, llama_batch_get_one(enc_input_buf, enc_input_size, 0, 0))) {
+        LOG_TEE("%s : failed to eval encode\n", __func__);
+        return 1;
+      }
+
+      llama_token decoder_start_token_id =
+          llama_model_decoder_start_token(model);
+      if (decoder_start_token_id == -1) {
+        decoder_start_token_id = llama_token_bos(model);
+      }
+
+      embd_inp.clear();
+      embd_inp.push_back(decoder_start_token_id);
+    }
+
+    while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
+      // predict
+      // LOG_TEE("%s-%s-%d", params.interactive ? "true" : "false",
+      //         is_antiprompt ? "true" : "false", n_remain);
+      if (!embd.empty()) {
+        // Note: (n_ctx - 4) here is to match the logic for commandline prompt
+        // handling via
+        // --prompt or --file which uses the same value.
+        int max_embd_size = n_ctx - 4;
+
+        if (ga_n == 1) {
+          // infinite text generation via context shifting
+          // if we run out of context:
+          // - take the n_keep first tokens from the original prompt (via
+          // n_past)
+          // - take half of the last (n_ctx - n_keep) tokens and recompute the
+          // logits in batches
+          if (n_past + (int)embd.size() >= n_ctx) {
+            if (params.n_predict == -2) {
+              LOG_TEE("\n\n%s: context full and n_predict == -%d => stopping\n",
+                      __func__, params.n_predict);
+              break;
+            }
+
+            const int n_left = n_past - params.n_keep;
+            const int n_discard = n_left / 2;
+
+            LOG("context full, swapping: n_past = %d, n_left = %d, n_ctx = %d, "
+                "n_keep = %d, n_discard = %d\n",
+                n_past, n_left, n_ctx, params.n_keep, n_discard);
+
+            llama_kv_cache_seq_rm(ctx, 0, params.n_keep,
+                                  params.n_keep + n_discard);
+            llama_kv_cache_seq_add(ctx, 0, params.n_keep + n_discard, n_past,
+                                   -n_discard);
+
+            n_past -= n_discard;
+
+            if (ctx_guidance) {
+              n_past_guidance -= n_discard;
+            }
+
+            LOG("after swap: n_past = %d, n_past_guidance = %d\n", n_past,
+                n_past_guidance);
+
+            LOG("embd: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd).c_str());
+
+            LOG("clear session path\n");
+            path_session.clear();
+          }
         } else {
-          // Outgoing Generated Tokens
-          output_tokens.push_back(id);
-          output_ss << token_str;
+          // context extension via Self-Extend
+          while (n_past >= ga_i + ga_w) {
+            const int ib = (ga_n * ga_i) / ga_w;
+            const int bd = (ga_w / ga_n) * (ga_n - 1);
+            const int dd = (ga_w / ga_n) - ib * bd - ga_w;
+
+            LOG("\n");
+            LOG("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", ga_i, n_past,
+                ib * bd, ga_i + ib * bd, n_past + ib * bd);
+            LOG("div:   [%6d, %6d] / %6d -> [%6d, %6d]\n", ga_i + ib * bd,
+                ga_i + ib * bd + ga_w, ga_n, (ga_i + ib * bd) / ga_n,
+                (ga_i + ib * bd + ga_w) / ga_n);
+            LOG("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n",
+                ga_i + ib * bd + ga_w, n_past + ib * bd, dd,
+                ga_i + ib * bd + ga_w + dd, n_past + ib * bd + dd);
+
+            llama_kv_cache_seq_add(ctx, 0, ga_i, n_past, ib * bd);
+            llama_kv_cache_seq_div(ctx, 0, ga_i + ib * bd,
+                                   ga_i + ib * bd + ga_w, ga_n);
+            llama_kv_cache_seq_add(ctx, 0, ga_i + ib * bd + ga_w,
+                                   n_past + ib * bd, dd);
+
+            n_past -= bd;
+
+            ga_i += ga_w / ga_n;
+
+            LOG("\nn_past_old = %d, n_past = %d, ga_i = %d\n\n", n_past + bd,
+                n_past, ga_i);
+          }
+        }
+
+        // try to reuse a matching prefix from the loaded session instead of
+        // re-eval (via n_past)
+        if (n_session_consumed < (int)session_tokens.size()) {
+          size_t i = 0;
+          for (; i < embd.size(); i++) {
+            if (embd[i] != session_tokens[n_session_consumed]) {
+              session_tokens.resize(n_session_consumed);
+              break;
+            }
+
+            n_past++;
+            n_session_consumed++;
+
+            if (n_session_consumed >= (int)session_tokens.size()) {
+              ++i;
+              break;
+            }
+          }
+          if (i > 0) {
+            embd.erase(embd.begin(), embd.begin() + i);
+          }
+        }
+
+        for (int i = 0; i < (int)embd.size(); i += params.n_batch) {
+          int n_eval = (int)embd.size() - i;
+          if (n_eval > params.n_batch) {
+            n_eval = params.n_batch;
+          }
+
+          LOG("eval: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd).c_str());
+
+          if (llama_decode(ctx,
+                           llama_batch_get_one(&embd[i], n_eval, n_past, 0))) {
+            LOG_TEE("%s : failed to eval decode\n", __func__);
+            return 1;
+          }
+
+          n_past += n_eval;
+
+          LOG("n_past = %d\n", n_past);
+          // Display total tokens alongside total time
+          if (params.n_print > 0 && n_past % params.n_print == 0) {
+            LOG_TEE("\n\033[31mTokens consumed so far = %d / %d \033[0m\n",
+                    n_past, n_ctx);
+          }
+        }
+
+        if (!embd.empty() && !path_session.empty()) {
+          session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
+          n_session_consumed = session_tokens.size();
         }
       }
 
-      // printf("\n");
-      // fflush(stdout);
-    }
+      embd.clear();
+      embd_guidance.clear();
 
-    // reset color to default if there is no pending user input
-    if (input_echo && (int)embd_inp.size() == n_consumed) {
-      console::set_display(console::reset);
-      display = true;
-    }
+      if ((int)embd_inp.size() <= n_consumed && !is_interacting) {
+        // optionally save the session on first sample (for faster prompt
+        // loading next time)
+        // if (!path_session.empty() && need_to_save_session &&
+        //     !params.prompt_cache_ro) {
+        //   need_to_save_session = false;
+        //   llama_state_save_file(ctx, path_session.c_str(),
+        //                         session_tokens.data(),
+        //                         session_tokens.size());
+        //
+        //   LOG("saved session to %s\n", path_session.c_str());
+        // }
 
-    // if not currently processing queued inputs;
-    if ((int)embd_inp.size() <= n_consumed) {
-      // check for reverse prompt in the last n_prev tokens
-      if (!params.antiprompt.empty()) {
-        const int n_prev = 32;
-        const std::string last_output =
-            llama_sampling_prev_str(ctx_sampling, ctx, n_prev);
+        const llama_token id =
+            llama_sampling_sample(ctx_sampling, ctx, ctx_guidance);
 
-        is_antiprompt = false;
-        // Check if each of the reverse prompts appears at the end of the
-        // output. If we're not running interactively, the reverse prompt
-        // might be tokenized with some following characters so we'll
-        // compensate for that by widening the search window a bit.
-        for (std::string &antiprompt : params.antiprompt) {
-          size_t extra_padding = params.interactive ? 0 : 2;
-          size_t search_start_pos =
-              last_output.length() >
-                      static_cast<size_t>(antiprompt.length() + extra_padding)
-                  ? last_output.length() -
+        llama_sampling_accept(ctx_sampling, ctx, id, /* apply_grammar= */ true);
+
+        LOG("last: %s\n",
+            LOG_TOKENS_TOSTR_PRETTY(ctx, ctx_sampling->prev).c_str());
+
+        embd.push_back(id);
+
+        // echo this to console
+        input_echo = true;
+
+        // decrement remaining sampling budget
+        --n_remain;
+
+        LOG("n_remain: %d\n", n_remain);
+      } else {
+        // some user input remains from prompt or interaction, forward it to
+        // processing
+        LOG("embd_inp.size(): %d, n_consumed: %d\n", (int)embd_inp.size(),
+            n_consumed);
+        while ((int)embd_inp.size() > n_consumed) {
+          embd.push_back(embd_inp[n_consumed]);
+
+          // push the prompt in the sampling context in order to apply
+          // repetition penalties later for the prompt, we don't apply grammar
+          // rules
+          llama_sampling_accept(ctx_sampling, ctx, embd_inp[n_consumed],
+                                /* apply_grammar= */ false);
+
+          ++n_consumed;
+          if ((int)embd.size() >= params.n_batch) {
+            break;
+          }
+        }
+      }
+
+      // display text
+      if (input_echo && display) {
+        for (auto id : embd) {
+          const std::string token_str =
+              llama_token_to_piece(ctx, id, params.special);
+
+          // Console/Stream Output
+          // fprintf(stdout, "%s", token_str.c_str());
+          printf("%s", token_str.c_str());
+
+          // Record Displayed Tokens To Log
+          // Note: Generated tokens are created one by one hence this check
+          if (embd.size() > 1) {
+            // Incoming Requested Tokens
+            input_tokens.push_back(id);
+          } else {
+            // Outgoing Generated Tokens
+            output_tokens.push_back(id);
+            output_ss << token_str;
+          }
+        }
+
+        // printf("\n");
+        // fflush(stdout);
+      }
+
+      // reset color to default if there is no pending user input
+      if (input_echo && (int)embd_inp.size() == n_consumed) {
+        console::set_display(console::reset);
+        display = true;
+      }
+
+      // if not currently processing queued inputs;
+      if ((int)embd_inp.size() <= n_consumed) {
+        // check for reverse prompt in the last n_prev tokens
+        if (!params.antiprompt.empty()) {
+          const int n_prev = 32;
+          const std::string last_output =
+              llama_sampling_prev_str(ctx_sampling, ctx, n_prev);
+
+          is_antiprompt = false;
+          // Check if each of the reverse prompts appears at the end of the
+          // output. If we're not running interactively, the reverse prompt
+          // might be tokenized with some following characters so we'll
+          // compensate for that by widening the search window a bit.
+          for (std::string &antiprompt : params.antiprompt) {
+            size_t extra_padding = params.interactive ? 0 : 2;
+            size_t search_start_pos =
+                last_output.length() >
                         static_cast<size_t>(antiprompt.length() + extra_padding)
-                  : 0;
+                    ? last_output.length() -
+                          static_cast<size_t>(antiprompt.length() +
+                                              extra_padding)
+                    : 0;
 
-          if (last_output.find(antiprompt, search_start_pos) !=
-              std::string::npos) {
-            if (params.interactive) {
-              is_interacting = true;
+            if (last_output.find(antiprompt, search_start_pos) !=
+                std::string::npos) {
+              if (params.interactive) {
+                is_interacting = true;
+              }
+              is_antiprompt = true;
+              break;
             }
-            is_antiprompt = true;
-            break;
+          }
+
+          // check for reverse prompt using special tokens
+          llama_token last_token = llama_sampling_last(ctx_sampling);
+          for (std::vector<llama_token> ids : antiprompt_ids) {
+            if (ids.size() == 1 && last_token == ids[0]) {
+              if (params.interactive) {
+                is_interacting = true;
+              }
+              is_antiprompt = true;
+              break;
+            }
+          }
+
+          if (is_antiprompt) {
+            LOG("found antiprompt: %s\n", last_output.c_str());
           }
         }
 
-        // check for reverse prompt using special tokens
-        llama_token last_token = llama_sampling_last(ctx_sampling);
-        for (std::vector<llama_token> ids : antiprompt_ids) {
-          if (ids.size() == 1 && last_token == ids[0]) {
-            if (params.interactive) {
-              is_interacting = true;
-            }
-            is_antiprompt = true;
-            break;
+        // deal with end of generation tokens in interactive mode
+        if (llama_token_is_eog(model, llama_sampling_last(ctx_sampling))) {
+          LOG("found an EOG token\n");
+        }
+
+        // if current token is not EOG, we add it to current assistant message
+        if (params.conversation) {
+          auto id = llama_sampling_last(ctx_sampling);
+          assistant_ss << llama_token_to_piece(ctx, id, false);
+        }
+
+        if (n_past > 0) {
+          if (is_interacting) {
+            llama_sampling_reset(ctx_sampling);
           }
-        }
-
-        if (is_antiprompt) {
-          LOG("found antiprompt: %s\n", last_output.c_str());
+          is_interacting = false;
         }
       }
 
-      // deal with end of generation tokens in interactive mode
-      if (llama_token_is_eog(model, llama_sampling_last(ctx_sampling))) {
-        LOG("found an EOG token\n");
-      }
-
-      // if current token is not EOG, we add it to current assistant message
-      if (params.conversation) {
-        auto id = llama_sampling_last(ctx_sampling);
-        assistant_ss << llama_token_to_piece(ctx, id, false);
-      }
-
-      if (n_past > 0) {
-        if (is_interacting) {
-          llama_sampling_reset(ctx_sampling);
-        }
-        is_interacting = false;
+      // end of generation
+      if (!embd.empty() && llama_token_is_eog(model, embd.back()) &&
+          !(params.interactive)) {
+        printf("\n");
+        fflush(stdout);
+        break;
       }
     }
 
-    // end of generation
-    if (!embd.empty() && llama_token_is_eog(model, embd.back()) &&
-        !(params.interactive)) {
-      printf("\n");
-      fflush(stdout);
-      break;
+    if (!path_session.empty() && params.prompt_cache_all &&
+        !params.prompt_cache_ro) {
+      LOG_TEE("\n%s: saving final output to session file '%s'\n", __func__,
+              path_session.c_str());
+      llama_state_save_file(ctx, path_session.c_str(), session_tokens.data(),
+                            session_tokens.size());
     }
-  }
 
-  if (!path_session.empty() && params.prompt_cache_all &&
-      !params.prompt_cache_ro) {
-    LOG_TEE("\n%s: saving final output to session file '%s'\n", __func__,
-            path_session.c_str());
-    llama_state_save_file(ctx, path_session.c_str(), session_tokens.data(),
-                          session_tokens.size());
-  }
+    // llama_print_timings(ctx);
+    // write_logfile(ctx, params, model, input_tokens, output_ss.str(),
+    //               output_tokens);
 
-  // llama_print_timings(ctx);
-  // write_logfile(ctx, params, model, input_tokens, output_ss.str(),
-  //               output_tokens);
-
-  if (ctx_guidance) {
-    llama_free(ctx_guidance);
+    if (ctx_guidance) {
+      llama_free(ctx_guidance);
+    }
+    llama_sampling_free(ctx_sampling);
   }
-  llama_sampling_free(ctx_sampling);
-  // }
 
   llama_free(ctx);
   llama_free_model(model);
